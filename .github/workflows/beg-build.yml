@@ -1,0 +1,359 @@
+name: Build BEG APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BEG_SUB_URL: ${{ secrets.BEG_SUB_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Check subscription secret
+        run: |
+          if [ -z "$BEG_SUB_URL" ]; then
+            echo "::error::Add a repository secret named BEG_SUB_URL (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+
+      - name: Apply BEG branding and built-in subscription
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, glob
+
+          ROOT = os.getcwd()
+          APP = os.path.join(ROOT, "V2rayNG", "app")
+          SRC = os.path.join(APP, "src", "main")
+          KT = os.path.join(SRC, "java", "com", "v2ray", "ang")
+          RES = os.path.join(SRC, "res")
+          SUB_URL = os.environ.get("BEG_SUB_URL", "").strip()
+          REPO = os.environ.get("GITHUB_REPOSITORY", "").strip()
+          APP_ID = "com.beg.vpn"
+
+          def rd(p):
+              with open(p, encoding="utf-8") as f:
+                  return f.read()
+
+          def wr(p, t):
+              os.makedirs(os.path.dirname(p), exist_ok=True)
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(t)
+
+          def sub(path, old, new, count=1):
+              t = rd(path)
+              if old not in t:
+                  sys.exit("PATCH FAILED: text not found in %s:\n%s" % (path, old))
+              wr(path, t.replace(old, new) if count == 0 else t.replace(old, new, count))
+
+          # 1. app name
+          n = 0
+          for p in glob.glob(os.path.join(RES, "values*", "strings.xml")):
+              t = rd(p)
+              t2 = t.replace('<string name="app_name" translatable="false">v2rayNG</string>',
+                             '<string name="app_name" translatable="false">BEG</string>')
+              if t2 != t:
+                  wr(p, t2)
+                  n += 1
+          if n == 0:
+              sys.exit("PATCH FAILED: app_name not found")
+
+          # 2. gradle (regex-based, resilient to upstream version bumps)
+          g = os.path.join(APP, "build.gradle.kts")
+          gt = rd(g)
+          gt = re.sub(r'applicationId\s*=\s*"[^"]+"', 'applicationId = "%s"' % APP_ID, gt, count=1)
+          gt = re.sub(r'versionCode\s*=\s*\d+', 'versionCode = 1', gt, count=1)
+          gt = re.sub(r'versionName\s*=\s*"[^"]+"', 'versionName = "1.0.0"', gt, count=1)
+          gt = gt.replace("v2rayNG_${variant.versionName}", "BEG_${variant.versionName}")
+          wr(g, gt)
+
+          # 3. shortcuts
+          sub(os.path.join(RES, "xml", "shortcuts.xml"),
+              'android:targetPackage="com.v2ray.ang"',
+              'android:targetPackage="%s"' % APP_ID, 0)
+
+          # 4. theme: red + black, dark by default, no wallpaper colours
+          th = os.path.join(KT, "ui", "compose", "Theme.kt")
+          t = rd(th)
+          t = t.replace("Color(0xFFf97910)", "Color(0xFFE5141A)")
+          t = t.replace('PREF_UI_MODE_NIGHT, "0") ?: "0"', 'PREF_UI_MODE_NIGHT, "2") ?: "2"')
+          t = t.replace("PREF_DYNAMIC_COLOR, true)", "PREF_DYNAMIC_COLOR, false)")
+
+          def patch_color_block(text, start_marker, end_marker, kv):
+              s = text.index(start_marker)
+              e = text.index(end_marker, s + len(start_marker))
+              block = text[s:e]
+              for k, v in kv.items():
+                  block, c = re.subn(r"(\n\s*%s\s*=\s*Color\()0x[0-9A-Fa-f]{8}" % k,
+                                     r"\g<1>%s" % v, block, count=1)
+                  if c != 1:
+                      sys.exit("PATCH FAILED: theme key %s in %s" % (k, start_marker))
+              return text[:s] + block + text[e:]
+
+          dark_kv = {
+              "primary": "0xFFFF3B30", "onPrimary": "0xFFFFFFFF",
+              "primaryContainer": "0xFF5A0A0E", "onPrimaryContainer": "0xFFFFDAD6",
+              "background": "0xFF050505", "surface": "0xFF050505",
+              "surfaceTint": "0xFFFF3B30",
+              "surfaceContainerLowest": "0xFF000000", "surfaceContainerLow": "0xFF0C0C0D",
+              "surfaceContainer": "0xFF121214", "surfaceContainerHigh": "0xFF18181B",
+              "surfaceContainerHighest": "0xFF1F1F23",
+          }
+          light_kv = {"primary": "0xFFE5141A", "surfaceTint": "0xFFE5141A"}
+
+          t = patch_color_block(t, "private val DarkColor", "// Semantic Colors", dark_kv)
+          if t.index("private val LightColor") < t.index("private val DarkColor"):
+              t = patch_color_block(t, "private val LightColor", "private val DarkColor", light_kv)
+          else:
+              t = patch_color_block(t, "private val LightColor", "// Semantic Colors", light_kv)
+          wr(th, t)
+
+          sa = os.path.join(KT, "ui", "settings", "SettingsActivity.kt")
+          sub(sa, 'rememberMmkvString(AppConfig.PREF_UI_MODE_NIGHT, "0")',
+                 'rememberMmkvString(AppConfig.PREF_UI_MODE_NIGHT, "2")')
+          sub(sa, 'rememberMmkvBool(AppConfig.PREF_DYNAMIC_COLOR, true)',
+                 'rememberMmkvBool(AppConfig.PREF_DYNAMIC_COLOR, false)')
+
+          # 5. launcher icon
+          wr(os.path.join(RES, "values", "ic_launcher_background.xml"),
+             '<?xml version="1.0" encoding="utf-8"?>\n'
+             '<resources>\n'
+             '    <color name="ic_launcher_background">#0A0A0A</color>\n'
+             '</resources>\n')
+          wr(os.path.join(RES, "drawable", "beg_icon_fg.xml"), '''<?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <group android:translateX="28" android:translateY="39" android:scaleX="0.75" android:scaleY="0.75">
+                  <path android:fillColor="#E5141A" android:fillType="evenOdd"
+                      android:pathData="M2,31c0,-3 9,-5 18,-6 1,-9 4,-22 12,-22s11,13 12,22c9,1 18,3 18,6 0,5 -14,7 -30,7S2,36 2,31zM24,23c5,1.5 11,1.5 16,0 -0.7,-8 -2.5,-14 -8,-14s-7.3,6 -8,14z" />
+              </group>
+          </vector>
+          ''')
+          wr(os.path.join(RES, "mipmap-anydpi-v26", "ic_launcher.xml"), '''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/beg_icon_fg" />
+              <monochrome android:drawable="@drawable/beg_icon_fg" />
+          </adaptive-icon>
+          ''')
+          rnd = os.path.join(RES, "mipmap-anydpi-v26", "ic_launcher_round.xml")
+          if os.path.exists(rnd):
+              wr(rnd, rd(os.path.join(RES, "mipmap-anydpi-v26", "ic_launcher.xml")))
+
+          # 6. update-check points to your own repo
+          if REPO:
+              ac = os.path.join(KT, "AppConfig.kt")
+              sub(ac, 'APP_URL = "$GITHUB_URL/2dust/v2rayNG"', 'APP_URL = "$GITHUB_URL/%s"' % REPO)
+              sub(ac, "repos/2dust/v2rayNG/releases", "repos/%s/releases" % REPO)
+
+          # 7. BEG bootstrap
+          wr(os.path.join(KT, "handler", "BegBootstrap.kt"), '''package com.v2ray.ang.handler
+
+          import com.v2ray.ang.AppConfig
+          import com.v2ray.ang.dto.entities.SubscriptionItem
+
+          /** BEG: ships a built-in subscription so every user gets the servers on first launch. */
+          object BegBootstrap {
+              private const val RAW_URL = "__BEG_SUB_URL__"
+              const val SUB_ID = "beg-main-subscription"
+
+              val isConfigured: Boolean
+                  get() = RAW_URL.startsWith("http")
+
+              /** Adds (or refreshes the URL of) the built-in subscription. Safe to call on every launch. */
+              fun ensureSubscription() {
+                  if (!isConfigured) return
+                  val existing = MmkvManager.decodeSubscription(SUB_ID)
+                  if (existing == null) {
+                      MmkvManager.encodeSubscription(
+                          SUB_ID,
+                          SubscriptionItem(
+                              remarks = "BEG",
+                              url = RAW_URL,
+                              enabled = true,
+                              autoUpdate = true,
+                              updateInterval = 360
+                          )
+                      )
+                  } else if (existing.url != RAW_URL) {
+                      existing.url = RAW_URL
+                      MmkvManager.encodeSubscription(SUB_ID, existing)
+                  }
+                  MmkvManager.encodeSettings(AppConfig.PREF_AUTO_TEST_AFTER_UPDATE_SUBSCRIPTION, true)
+              }
+          }
+          '''.replace("__BEG_SUB_URL__", SUB_URL or "__BEG_SUB_URL__"))
+
+          vm = os.path.join(KT, "ui", "main", "MainViewModel.kt")
+          sub(vm, "                dataSource.initAssets()\n                dataSource.syncSubscriptions()\n",
+              "                dataSource.initAssets()\n                BegBootstrap.ensureSubscription()\n                dataSource.syncSubscriptions()\n"
+              "                if (BegBootstrap.isConfigured) {\n                    importConfigViaSub(BegBootstrap.SUB_ID)\n                }\n")
+          sub(vm, "                    if (result.configCount > 0) {\n                        setupGroupTab(forceRefresh = true)\n                        refreshSelectedGuid()\n                    }\n",
+              "                    if (result.configCount > 0) {\n                        setupGroupTab(forceRefresh = true)\n                        refreshSelectedGuid()\n"
+              "                        if (subId == BegBootstrap.SUB_ID) {\n                            delay(800)\n                            subscriptionIdChanged(BegBootstrap.SUB_ID)\n                            delay(800)\n                            testAllRealPing()\n                        }\n                    }\n")
+          t = rd(vm)
+          if "import com.v2ray.ang.handler.BegBootstrap" not in t:
+              t = t.replace("import com.v2ray.ang.AppConfig\n",
+                            "import com.v2ray.ang.AppConfig\nimport com.v2ray.ang.handler.BegBootstrap\n", 1)
+              wr(vm, t)
+
+          # 8. BEG: tapping the power button must really start the VPN
+          ma = os.path.join(KT, "ui", "main", "MainActivity.kt")
+          sub(ma,
+              "    private fun startV2Ray() {\n"
+              "        if (mainViewModel.uiState.value.selectedGuid.isNullOrEmpty()) {\n"
+              "            toast(R.string.title_file_chooser)\n"
+              "            return\n"
+              "        }\n",
+              "    private fun startV2Ray() {\n"
+              "        if (mainViewModel.uiState.value.selectedGuid.isNullOrEmpty()) {\n"
+              "            // BEG: no server chosen yet -> pick the best one automatically.\n"
+              "            var guids = MmkvManager.decodeServerList(BegBootstrap.SUB_ID)\n"
+              "            if (guids.isEmpty()) guids = MmkvManager.decodeAllServerList()\n"
+              "            val best = guids.filter { (MmkvManager.decodeServerAffiliationInfo(it)?.testDelayMillis ?: 0L) > 0L }\n"
+              "                .minByOrNull { MmkvManager.decodeServerAffiliationInfo(it)?.testDelayMillis ?: Long.MAX_VALUE }\n"
+              "                ?: guids.firstOrNull()\n"
+              "            if (best == null) {\n"
+              "                toast(R.string.title_file_chooser)\n"
+              "                return\n"
+              "            }\n"
+              "            mainViewModel.updateSelectedGuid(best)\n"
+              "        }\n")
+          t = rd(ma)
+          if "import com.v2ray.ang.handler.BegBootstrap" not in t:
+              t = t.replace("import com.v2ray.ang.handler.AngConfigManager\n",
+                            "import com.v2ray.ang.handler.AngConfigManager\nimport com.v2ray.ang.handler.BegBootstrap\n", 1)
+              wr(ma, t)
+
+          print("BEG patch applied OK")
+          PY
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android SDK packages
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "platform-tools"
+
+      - name: Install NDK
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            --channel=0 \
+            --install "ndk;30.0.16248370"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> $GITHUB_ENV
+          python3 - <<'PY'
+          import re, os
+          p = os.path.join(os.environ["GITHUB_WORKSPACE"], "V2rayNG", "app", "build.gradle.kts")
+          t = open(p, encoding="utf-8").read()
+          if 'ndkVersion' not in t:
+              t = re.sub(r'(android\s*\{[^\n]*\n)',
+                         r'\1    ndkVersion = "30.0.16248370"\n', t, count=1)
+              open(p, "w", encoding="utf-8").write(t)
+          PY
+
+      - name: Restore cached libhevtun
+        id: cache-libhevtun-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/libs
+          key: libhevtun-${{ runner.os }}-${{ env.NDK_HOME }}-${{ hashFiles('.git/modules/hev-socks5-tunnel/HEAD') }}-${{ hashFiles('compile-hevtun.sh') }}
+
+      - name: Build libhevtun
+        if: steps.cache-libhevtun-restore.outputs.cache-hit != 'true'
+        run: |
+          bash compile-hevtun.sh
+
+      - name: Save libhevtun
+        if: steps.cache-libhevtun-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/libs
+          key: libhevtun-${{ runner.os }}-${{ env.NDK_HOME }}-${{ hashFiles('.git/modules/hev-socks5-tunnel/HEAD') }}-${{ hashFiles('compile-hevtun.sh') }}
+
+      - name: Copy libhevtun
+        run: |
+          cp -r ${{ github.workspace }}/libs ${{ github.workspace }}/V2rayNG/app
+
+      - name: Fetch AndroidLibXrayLite tag
+        run: |
+          pushd AndroidLibXrayLite
+          CURRENT_TAG=$(git describe --tags --abbrev=0)
+          echo "Current tag in this repo: $CURRENT_TAG"
+          echo "CURRENT_TAG=$CURRENT_TAG" >> $GITHUB_ENV
+          popd
+
+      - name: Download libv2ray
+        uses: robinraju/release-downloader@v1.11
+        with:
+          repository: '2dust/AndroidLibXrayLite'
+          tag: ${{ env.CURRENT_TAG }}
+          fileName: 'libv2ray.aar'
+          out-file-path: V2rayNG/app/libs/
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Prepare signing key
+        env:
+          KS_B64: ${{ secrets.BEG_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.BEG_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.BEG_KEY_ALIAS }}
+          KS_KPASS: ${{ secrets.BEG_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/beg.jks"
+            echo "SIGN_PASS=$KS_PASS" >> $GITHUB_ENV
+            echo "SIGN_ALIAS=$KS_ALIAS" >> $GITHUB_ENV
+            echo "SIGN_KPASS=$KS_KPASS" >> $GITHUB_ENV
+          else
+            echo "::warning::No permanent key set. Using a temporary key: updates will not install over older builds."
+            keytool -genkeypair -keystore "$RUNNER_TEMP/beg.jks" -storepass begtemp123 -keypass begtemp123 -alias beg -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=BEG"
+            echo "SIGN_PASS=begtemp123" >> $GITHUB_ENV
+            echo "SIGN_ALIAS=beg" >> $GITHUB_ENV
+            echo "SIGN_KPASS=begtemp123" >> $GITHUB_ENV
+          fi
+          echo "SIGN_FILE=$RUNNER_TEMP/beg.jks" >> $GITHUB_ENV
+
+      - name: Build APK
+        run: |
+          cd ${{ github.workspace }}/V2rayNG
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          chmod 755 gradlew
+          ./gradlew licenseFdroidReleaseReport
+          ./gradlew assemblePlaystoreRelease \
+            -Pandroid.injected.signing.store.file=$SIGN_FILE \
+            -Pandroid.injected.signing.store.password=$SIGN_PASS \
+            -Pandroid.injected.signing.key.alias=$SIGN_ALIAS \
+            -Pandroid.injected.signing.key.password=$SIGN_KPASS
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: BEG-apk
+          path: ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/playstore/release/*.apk
+
+      - name: Publish download link (GitHub release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete beg-latest --yes --cleanup-tag || true
+          gh release create beg-latest ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/playstore/release/*.apk --title "BEG" --notes "Latest BEG build"
